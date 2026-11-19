@@ -1,16 +1,39 @@
+// GEO 未设置或为 1 时注入 ECS；未指定 DOH 则用 dns.google。GEO=0 透明转发。ECS_V4_PREFIX 默认 24，ECS_V6_PREFIX 默认 56。
 let DoH = "cloudflare-dns.com";
-const jsonDoH = `https://${DoH}/resolve`;
-const dnsDoH = `https://${DoH}/dns-query`;
 let DoH路径 = 'dns-query';
+
+function clampPrefix(value, fallback, max) {
+  const n = Number.parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 0 || n > max) return fallback;
+  return n;
+}
+
+function resolveUpstream(env) {
+  const geoRaw = env && env.GEO;
+  const geoOff = geoRaw === '0' || geoRaw === 0 || String(geoRaw).toLowerCase() === 'false';
+  const geoOn = !geoOff;
+  let host = ((env && env.DOH) || (geoOn ? 'dns.google' : 'cloudflare-dns.com')).toString().trim();
+  const match = host.match(/:\/\/([^\/]+)/);
+  if (match) host = match[1];
+  host = host.split('/')[0];
+  return {
+    geoOn,
+    host,
+    jsonDoH: `https://${host}/resolve`,
+    dnsDoH: `https://${host}/dns-query`,
+    v4Prefix: clampPrefix(env && env.ECS_V4_PREFIX, 24, 32),
+    v6Prefix: clampPrefix(env && env.ECS_V6_PREFIX, 56, 128),
+  };
+}
+
 export default {
   async fetch(request, env) {
-    if (env.DOH) {
-      DoH = env.DOH;
-      const match = DoH.match(/:\/\/([^\/]+)/);
-      if (match) {
-        DoH = match[1];
-      }
-    }
+    const upstream = resolveUpstream(env);
+    DoH = upstream.host;
+    const subnet = upstream.geoOn
+      ? clientSubnet(request.headers.get('CF-Connecting-IP'), upstream.v4Prefix, upstream.v6Prefix)
+      : null;
+    const ctx = { ...upstream, subnet };
     DoH路径 = env.PATH || env.TOKEN || DoH路径;//DoH路径也单独设置 变量PATH
     if (DoH路径.includes("/")) DoH路径 = DoH路径.split("/")[1];
     const url = new URL(request.url);
@@ -31,7 +54,7 @@ export default {
 
     // 如果请求路径，则作为 DoH 服务器处理
     if (path === `/${DoH路径}`) {
-      return await DOHRequest(request);
+      return await DOHRequest(request, ctx);
     }
 
     // 添加IP地理位置信息查询代理
@@ -116,21 +139,22 @@ export default {
     // 如果请求参数中包含 domain 和 doh，则执行 DNS 解析
     if (url.searchParams.has("doh")) {
       const domain = url.searchParams.get("domain") || url.searchParams.get("name") || "www.google.com";
-      const doh = url.searchParams.get("doh") || dnsDoH;
+      const doh = url.searchParams.get("doh") || ctx.dnsDoH;
       const type = url.searchParams.get("type") || "all"; // 默认同时查询 A 和 AAAA
+      const ecs = ecsTextFor(doh, ctx);
 
       // 如果使用的是当前站点，则使用 DoH 服务
       if (doh.includes(url.host)) {
-        return await handleLocalDohRequest(domain, type, hostname);
+        return await handleLocalDohRequest(domain, type, hostname, ctx);
       }
 
       try {
         // 根据请求类型进行不同的处理
         if (type === "all") {
           // 同时请求 A、AAAA 和 NS 记录，使用新的查询函数
-          const ipv4Result = await queryDns(doh, domain, "A");
-          const ipv6Result = await queryDns(doh, domain, "AAAA");
-          const nsResult = await queryDns(doh, domain, "NS");
+          const ipv4Result = await queryDns(doh, domain, "A", ecs);
+          const ipv6Result = await queryDns(doh, domain, "AAAA", ecs);
+          const nsResult = await queryDns(doh, domain, "NS", ecs);
 
           // 合并结果 - 修改Question字段处理方式以兼容不同格式
           const combinedResult = {
@@ -208,13 +232,19 @@ export default {
           combinedResult.ns.records = nsRecords;
 
           return new Response(JSON.stringify(combinedResult, null, 2), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+            headers: {
+              "content-type": "application/json; charset=UTF-8",
+              'Cache-Control': 'no-store'
+            }
           });
         } else {
           // 普通的单类型查询，使用新的查询函数
-          const result = await queryDns(doh, domain, type);
+          const result = await queryDns(doh, domain, type, ecs);
           return new Response(JSON.stringify(result, null, 2), {
-            headers: { "content-type": "application/json; charset=UTF-8" }
+            headers: {
+              "content-type": "application/json; charset=UTF-8",
+              'Cache-Control': 'no-store'
+            }
           });
         }
       } catch (err) {
@@ -244,12 +274,289 @@ export default {
   }
 }
 
+function readUint16(buf, off) {
+  return (buf[off] << 8) | buf[off + 1];
+}
+
+function skipName(buf, off) {
+  let pos = off;
+  let jumps = 0;
+  while (pos < buf.length && jumps < 128) {
+    const len = buf[pos];
+    if (len === 0) return pos + 1;
+    if ((len & 0xc0) === 0xc0) {
+      if (pos + 1 >= buf.length) return -1;
+      return pos + 2;
+    }
+    if ((len & 0xc0) !== 0) return -1;
+    pos += 1 + len;
+    jumps++;
+  }
+  return -1;
+}
+
+function skipRR(buf, off) {
+  const nameEnd = skipName(buf, off);
+  if (nameEnd < 0 || nameEnd + 10 > buf.length) return -1;
+  const rdlen = readUint16(buf, nameEnd + 8);
+  const end = nameEnd + 10 + rdlen;
+  if (end > buf.length) return -1;
+  return end;
+}
+
+function parseIPv4(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  const bytes = new Uint8Array(4);
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return null;
+    const n = Number(parts[i]);
+    if (n > 255) return null;
+    bytes[i] = n;
+  }
+  return bytes;
+}
+
+function parseIPv6(ip) {
+  const core = ip.split('%')[0];
+  if (core.includes('.')) return null;
+  const halves = core.split('::');
+  if (halves.length > 2) return null;
+  const parseGroups = (s) => {
+    if (s === '') return [];
+    const groups = [];
+    for (const part of s.split(':')) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(part)) return null;
+      groups.push(parseInt(part, 16));
+    }
+    return groups;
+  };
+  const head = parseGroups(halves[0]);
+  if (!head) return null;
+  let tail = [];
+  if (halves.length === 2) {
+    tail = parseGroups(halves[1]);
+    if (!tail) return null;
+  }
+  if (halves.length === 1) {
+    if (head.length !== 8) return null;
+  } else if (head.length + tail.length > 7) {
+    return null;
+  }
+  const zeros = 8 - head.length - tail.length;
+  const groups = halves.length === 1 ? head : head.concat(Array(zeros).fill(0), tail);
+  const bytes = new Uint8Array(16);
+  for (let i = 0; i < 8; i++) {
+    bytes[i * 2] = (groups[i] >> 8) & 0xff;
+    bytes[i * 2 + 1] = groups[i] & 0xff;
+  }
+  return bytes;
+}
+
+function maskBytes(bytes, prefix) {
+  const out = new Uint8Array(bytes);
+  const full = Math.floor(prefix / 8);
+  const rem = prefix % 8;
+  let i = full;
+  if (rem && i < out.length) {
+    out[i] = out[i] & ((0xff << (8 - rem)) & 0xff);
+    i += 1;
+  }
+  for (; i < out.length; i++) out[i] = 0;
+  return out;
+}
+
+function formatIPv6(bytes) {
+  const groups = [];
+  for (let i = 0; i < 8; i++) groups.push((bytes[i * 2] << 8) | bytes[i * 2 + 1]);
+  let bestStart = -1;
+  let bestLen = 0;
+  for (let i = 0; i < 8;) {
+    if (groups[i] !== 0) {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < 8 && groups[j] === 0) j++;
+    if (j - i > bestLen) {
+      bestStart = i;
+      bestLen = j - i;
+    }
+    i = j;
+  }
+  if (bestLen < 2) bestStart = -1;
+  if (bestLen === 8) return '::';
+  const parts = [];
+  for (let i = 0; i < 8;) {
+    if (i === bestStart) {
+      parts.push('');
+      i += bestLen;
+      if (i >= 8) parts.push('');
+      continue;
+    }
+    parts.push(groups[i].toString(16));
+    i++;
+  }
+  let text = parts.join(':');
+  if (bestStart === 0) text = ':' + text;
+  return text;
+}
+
+function clientSubnet(ip, v4Prefix, v6Prefix) {
+  if (!ip) return null;
+  if (ip.includes('.')) {
+    const raw = parseIPv4(ip);
+    if (!raw) return null;
+    const masked = maskBytes(raw, v4Prefix);
+    return {
+      family: 1,
+      prefix: v4Prefix,
+      address: masked.slice(0, Math.ceil(v4Prefix / 8)),
+      text: `${masked[0]}.${masked[1]}.${masked[2]}.${masked[3]}/${v4Prefix}`,
+    };
+  }
+  const raw = parseIPv6(ip);
+  if (!raw) return null;
+  const masked = maskBytes(raw, v6Prefix);
+  return {
+    family: 2,
+    prefix: v6Prefix,
+    address: masked.slice(0, Math.ceil(v6Prefix / 8)),
+    text: `${formatIPv6(masked)}/${v6Prefix}`,
+  };
+}
+
+function ecsTextFor(dohServer, ctx) {
+  if (!ctx || !ctx.subnet) return '';
+  try {
+    const host = new URL(dohServer).hostname;
+    if (host === 'dns.google' || host === ctx.host) return ctx.subnet.text;
+  } catch (e) {}
+  return '';
+}
+
+function base64UrlToBytes(value) {
+  const pad = value.length % 4 === 0 ? '' : '='.repeat(4 - (value.length % 4));
+  const b64 = value.replace(/-/g, '+').replace(/_/g, '/') + pad;
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function ecsOption(subnet) {
+  const addr = subnet.address;
+  const optLen = 4 + addr.length;
+  const out = new Uint8Array(4 + optLen);
+  out[1] = 8;
+  out[2] = (optLen >> 8) & 0xff;
+  out[3] = optLen & 0xff;
+  out[4] = (subnet.family >> 8) & 0xff;
+  out[5] = subnet.family & 0xff;
+  out[6] = subnet.prefix & 0xff;
+  out.set(addr, 8);
+  return out;
+}
+
+function optionHasEcs(buf, rdataOff, rdlen) {
+  let p = rdataOff;
+  const end = rdataOff + rdlen;
+  while (p + 4 <= end) {
+    const code = readUint16(buf, p);
+    const len = readUint16(buf, p + 2);
+    if (p + 4 + len > end) return null;
+    if (code === 8) return true;
+    p += 4 + len;
+  }
+  if (p !== end) return null;
+  return false;
+}
+
+// 解析失败返回 null。已有 ECS 时返回原报文。
+function injectEcs(message, subnet) {
+  if (!(message instanceof Uint8Array) || message.length < 12 || !subnet) return null;
+  const buf = message;
+  const qd = readUint16(buf, 4);
+  const an = readUint16(buf, 6);
+  const ns = readUint16(buf, 8);
+  const ar = readUint16(buf, 10);
+  let off = 12;
+  for (let i = 0; i < qd; i++) {
+    off = skipName(buf, off);
+    if (off < 0 || off + 4 > buf.length) return null;
+    off += 4;
+  }
+  for (let i = 0; i < an + ns; i++) {
+    off = skipRR(buf, off);
+    if (off < 0) return null;
+  }
+  let opt = null;
+  for (let i = 0; i < ar; i++) {
+    const nameEnd = skipName(buf, off);
+    if (nameEnd < 0 || nameEnd + 10 > buf.length) return null;
+    const type = readUint16(buf, nameEnd);
+    const rdlen = readUint16(buf, nameEnd + 8);
+    const rdataOff = nameEnd + 10;
+    const end = rdataOff + rdlen;
+    if (end > buf.length) return null;
+    if (type === 41) {
+      const has = optionHasEcs(buf, rdataOff, rdlen);
+      if (has === null) return null;
+      if (has) return buf;
+      if (!opt) opt = { rdlenOff: nameEnd + 8, rdlen, end };
+    }
+    off = end;
+  }
+  if (off !== buf.length) return null;
+
+  const option = ecsOption(subnet);
+  if (!opt) {
+    const optRR = new Uint8Array(11 + option.length);
+    optRR[2] = 41;
+    optRR[3] = 0x04;
+    optRR[4] = 0xd0;
+    optRR[9] = (option.length >> 8) & 0xff;
+    optRR[10] = option.length & 0xff;
+    optRR.set(option, 11);
+    const out = new Uint8Array(buf.length + optRR.length);
+    out.set(buf, 0);
+    out.set(optRR, buf.length);
+    const arcount = ar + 1;
+    out[10] = (arcount >> 8) & 0xff;
+    out[11] = arcount & 0xff;
+    return out;
+  }
+
+  const newRdlen = opt.rdlen + option.length;
+  if (newRdlen > 0xffff) return null;
+  const out = new Uint8Array(buf.length + option.length);
+  out.set(buf.subarray(0, opt.end), 0);
+  out.set(option, opt.end);
+  out.set(buf.subarray(opt.end), opt.end + option.length);
+  out[opt.rdlenOff] = (newRdlen >> 8) & 0xff;
+  out[opt.rdlenOff + 1] = newRdlen & 0xff;
+  return out;
+}
+
+function postDns(url, bytes, ua) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/dns-message',
+      'Content-Type': 'application/dns-message',
+      'User-Agent': ua
+    },
+    body: bytes
+  });
+}
+
 // 查询DNS的通用函数
-async function queryDns(dohServer, domain, type) {
+async function queryDns(dohServer, domain, type, ecs) {
   // 构造 DoH 请求 URL
   const dohUrl = new URL(dohServer);
   dohUrl.searchParams.set("name", domain);
   dohUrl.searchParams.set("type", type);
+  if (ecs) dohUrl.searchParams.set("edns_client_subnet", ecs);
 
   // 尝试多种请求头格式
   const fetchOptions = [
@@ -313,13 +620,15 @@ async function queryDns(dohServer, domain, type) {
 }
 
 // 处理本地 DoH 请求的函数 - 直接调用 DoH，而不是自身服务
-async function handleLocalDohRequest(domain, type, hostname) {
+async function handleLocalDohRequest(domain, type, hostname, ctx) {
+  const jsonBase = ctx.host === 'dns.google' ? ctx.jsonDoH : ctx.dnsDoH;
+  const ecs = ctx.subnet ? ctx.subnet.text : '';
   try {
     if (type === "all") {
       // 同时请求 A、AAAA 和 NS 记录
-      const ipv4Promise = queryDns(dnsDoH, domain, "A");
-      const ipv6Promise = queryDns(dnsDoH, domain, "AAAA");
-      const nsPromise = queryDns(dnsDoH, domain, "NS");
+      const ipv4Promise = queryDns(jsonBase, domain, "A", ecs);
+      const ipv6Promise = queryDns(jsonBase, domain, "AAAA", ecs);
+      const nsPromise = queryDns(jsonBase, domain, "NS", ecs);
 
       // 等待所有请求完成
       const [ipv4Result, ipv6Result, nsResult] = await Promise.all([ipv4Promise, ipv6Promise, nsPromise]);
@@ -364,16 +673,18 @@ async function handleLocalDohRequest(domain, type, hostname) {
       return new Response(JSON.stringify(combinedResult, null, 2), {
         headers: {
           "content-type": "application/json; charset=UTF-8",
-          'Access-Control-Allow-Origin': '*'
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store'
         }
       });
     } else {
       // 普通的单类型查询
-      const result = await queryDns(dnsDoH, domain, type);
+      const result = await queryDns(jsonBase, domain, type, ecs);
       return new Response(JSON.stringify(result, null, 2), {
         headers: {
           "content-type": "application/json; charset=UTF-8",
-          'Access-Control-Allow-Origin': '*'
+          'Access-Control-Allow-Origin': '*',
+          'Cache-Control': 'no-store'
         }
       });
     }
@@ -393,8 +704,8 @@ async function handleLocalDohRequest(domain, type, hostname) {
 }
 
 // DoH 请求处理函数
-async function DOHRequest(request) {
-  const { method, headers, body } = request;
+async function DOHRequest(request, ctx) {
+  const { method, headers } = request;
   const UA = headers.get('User-Agent') || 'DoH Client';
   const url = new URL(request.url);
   const { searchParams } = url;
@@ -416,40 +727,57 @@ async function DOHRequest(request) {
     let response;
 
     if (method === 'GET' && searchParams.has('name')) {
-      const searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
-      // 处理 JSON 格式的 DoH 请求
-      response = await fetch(dnsDoH + searchDoH, {
+      let searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
+      if (ctx.subnet) {
+        searchDoH += '&edns_client_subnet=' + encodeURIComponent(ctx.subnet.text);
+      }
+      // Google 的 JSON 在 /resolve。其它上游仍先走 /dns-query，失败再试 /resolve。
+      const primary = ctx.host === 'dns.google' ? ctx.jsonDoH : ctx.dnsDoH;
+      const secondary = ctx.host === 'dns.google' ? ctx.dnsDoH : ctx.jsonDoH;
+      response = await fetch(primary + searchDoH, {
         headers: {
           'Accept': 'application/dns-json',
           'User-Agent': UA
         }
       });
-      // 如果 DoHUrl 请求非成功（状态码 200），则再请求 jsonDoH
-      if (!response.ok) response = await fetch(jsonDoH + searchDoH, {
+      if (!response.ok) response = await fetch(secondary + searchDoH, {
         headers: {
           'Accept': 'application/dns-json',
           'User-Agent': UA
         }
       });
     } else if (method === 'GET') {
-      // 处理 base64url 格式的 GET 请求
-      response = await fetch(dnsDoH + url.search, {
-        headers: {
-          'Accept': 'application/dns-message',
-          'User-Agent': UA
+      // 处理 base64url 格式的 GET 请求。改写报文后改为 POST，避免查询串过长。
+      let forwarded = false;
+      const dnsParam = searchParams.get('dns');
+      if (dnsParam && ctx.geoOn && ctx.subnet) {
+        try {
+          const raw = base64UrlToBytes(dnsParam);
+          const rewritten = injectEcs(raw, ctx.subnet);
+          if (rewritten) {
+            response = await postDns(ctx.dnsDoH, rewritten, UA);
+            forwarded = true;
+          }
+        } catch (e) {
+          forwarded = false;
         }
-      });
+      }
+      if (!forwarded) {
+        response = await fetch(ctx.dnsDoH + url.search, {
+          headers: {
+            'Accept': 'application/dns-message',
+            'User-Agent': UA
+          }
+        });
+      }
     } else if (method === 'POST') {
-      // 处理 POST 请求
-      response = await fetch(dnsDoH, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/dns-message',
-          'Content-Type': 'application/dns-message',
-          'User-Agent': UA
-        },
-        body: body
-      });
+      const raw = new Uint8Array(await request.arrayBuffer());
+      let payload = raw;
+      if (ctx.geoOn && ctx.subnet) {
+        const rewritten = injectEcs(raw, ctx.subnet);
+        if (rewritten) payload = rewritten;
+      }
+      response = await postDns(ctx.dnsDoH, payload, UA);
 
     } else {
       // 其他不支持的请求方式
@@ -473,6 +801,7 @@ async function DOHRequest(request) {
     responseHeaders.set('Access-Control-Allow-Origin', '*');
     responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     responseHeaders.set('Access-Control-Allow-Headers', '*');
+    responseHeaders.set('Cache-Control', 'no-store');
     
     // 检查是否为JSON格式的DoH请求，确保设置正确的Content-Type
     if (method === 'GET' && searchParams.has('name')) {
@@ -1682,3 +2011,5 @@ async function nginx() {
 	`
   return text;
 }
+
+export { injectEcs, clientSubnet, resolveUpstream };
